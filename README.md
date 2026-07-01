@@ -957,3 +957,657 @@ Benefits:
 - Page cache usage.
 - Zero-copy transfers.
 - Partition-based parallelism.
+
+
+# Kafka Notes
+
+---
+
+# Failure Scenarios
+
+### 1)
+- Reprocessing of events when **consumer crashes before committing the offset**.
+
+### 2)
+- Consumer crashes or takes long for processing.
+
+Diagram (concept):
+
+```
+OE
+
++---------+          +---------+
+|   P1    | <------  |   C1    |
+|   P2    |          |   C2    |
++---------+          +---------+
+    B1
+
+                    +---------+
+                    |   C     |
+                    |   C2    |
+                    +---------+
+                        B2
+                  (offsets managed here)
+```
+
+- C fails or takes long for heartbeat.
+- B2 removes C from there.
+- Assigns C2 to consume events which might already be there in the queue.
+- C tries to commit → **fails**.
+
+---
+
+# Cluster Setup
+
+- `bin`
+- `config`
+
+### Roles
+
+- Controller
+- Broker (Controller + Broker)
+
+### ID
+- Unique ID
+
+### Listeners
+
+Internally opens a new socket server connection to these ports.
+
+```
+CONTROLLER://:9093
+BROKER://:9092
+```
+
+### controller.listener.names
+
+- Which node to choose in order to communicate with other nodes.
+
+Suppose you mention:
+
+```
+CONTROLLER
+```
+
+and you have above two options,
+
+then it will use the **9093** one.
+
+---
+
+### quorum.voters
+
+```properties
+quorum.voters=1@localhost:9093
+```
+
+### listener.security.protocol.map
+
+```properties
+CONTROLLER:PLAINTEXT
+```
+
+Also supports:
+
+- SSL/TLS
+
+### logs.dirs
+
+```properties
+/tmp/c1.logs
+```
+
+### num.partitions
+
+```properties
+3
+```
+
+### default.replication.factor
+
+```properties
+2
+```
+
+Similar configuration is for Brokers.
+
+In broker we need to specify:
+
+- listeners
+    - Ports on which our Producer/Consumer
+      (Spring Boot / Node applications)
+      will connect.
+
+Other broker configurations:
+
+- offset replication factor
+- log segment size
+
+---
+
+# Generate Cluster ID
+
+### Step 1
+
+```bash
+bin/kafka-storage.sh random-uuid
+```
+
+Output:
+
+```
+xyz...
+```
+
+Then:
+
+```bash
+bin/kafka-storage.sh format \
+-t <output> \
+-c config/controller.properties
+```
+
+Same for **all nodes**.
+
+This will create:
+
+```
+meta.properties
+```
+
+---
+
+### Step 2
+
+Start all nodes
+
+1. Controllers
+2. Brokers
+
+```bash
+kafka-server-start.sh <properties-path>
+```
+
+---
+
+Now it will create **Cluster Metadata**
+
+Inside it we have:
+
+- quorum-state
+    - showing the voting process for
+      leader & follower.
+
+Now we can check the cluster status.
+
+We cannot directly contact controllers,
+so we connect to any broker first.
+
+Create a topic.
+
+Then check the status.
+
+You'll get:
+
+- partitions
+- replicas
+- leaders
+- etc.
+
+---
+
+# Producer Flow
+
+### Case 1
+
+Partition provided.
+
+### Case 2
+
+Key is provided.
+
+### Case 3
+
+No key / No partition
+
+Old:
+
+- Round Robin
+
+New approach:
+
+- Sticky Partitioning
+
+---
+
+Flow
+
+```
+Serialization
+      ↓
+Partition
+      ↓
+Accumulator Append
+      ↓
+Compression
+      ↓
+Sender Thread
+```
+
+---
+
+### Record Accumulator
+
+Application thread is free after accumulator.
+
+Accumulator is an in-memory buffer of Kafka.
+
+It:
+
+- Collects events topic partition wise.
+- Groups them into batches.
+
+Compression:
+
+- Snappy
+- Gzip
+
+Topic partition-wise batches ensure broker doesn't need to connect & append repeatedly.
+
+Sender thread:
+
+- Looks for batches.
+- Finds leader broker for partition.
+- Sends them.
+
+---
+
+# Round Robin vs Sticky Partitioning
+
+### Round Robin
+
+Batch sizes may become very small,
+eventually leading to multiple network calls.
+
+### Sticky Partitioning
+
+Unlike Round Robin,
+
+events of a certain topic stick to a single partition,
+
+resulting in much larger batch sizes.
+
+Record Accumulator keeps track of this.
+
+---
+
+### Batch Size
+
+Example:
+
+```
+1 event = 1 KB
+```
+
+### Linger.ms
+
+Batch building duration.
+
+Example:
+
+```
+10 ms
+```
+
+Wait for 10 ms,
+
+accumulate all records,
+
+then send.
+
+After accumulation,
+messages are compressed.
+
+---
+
+# Max Inflight Connections
+
+Sender Thread
+
+Default:
+
+```
+5
+```
+
+If:
+
+```
+max.retry > 0
+```
+
+and
+
+```
+inflight.connections > 1
+```
+
+Problems:
+
+1. Reconsumption of event.
+2. Order interchanged.
+
+Solution:
+
+```properties
+enable.idempotence=true
+```
+
+---
+
+## Producer ID (PID)
+
+Producer requests a unique PID from Kafka Cluster.
+
+Now in Record Accumulator every batch header contains:
+
+1. PID
+2. Base Sequence
+3. Last Sequence
+
+Topic partition-wise sequence.
+
+Each event gets a sequence number.
+
+Example:
+
+```
+Event 1 → seq 0
+Event 2 → seq 1
+Event 3 → seq 2
+```
+
+Even if retried,
+same sequence number is used.
+
+Example:
+
+```
+Base Seq : 0
+Last Seq : 2
+```
+
+---
+
+# Kafka Listener
+
+If we take Java scenario,
+
+using:
+
+```java
+@KafkaListener
+```
+
+By default:
+
+- accepts one event
+- creates one consumer
+- listens to that event.
+
+If one consumer should consume multiple events,
+
+use:
+
+```java
+@KafkaListener
+```
+
+and pass a list of topics.
+
+---
+
+In `application.properties`
+
+Deserializer:
+
+```
+StringDeserializer
+```
+
+Then conditionally typecast it to that event.
+
+Producer:
+
+```java
+KafkaTemplate<String, Object>
+```
+
+When Object is used,
+
+Kafka sends by default a
+
+```
+__TypeId__
+```
+
+inside event header.
+
+Example:
+
+```
+__TypeId__ = com.eda.producer.model.Order
+```
+
+---
+
+# Producer → Consumer Mapping
+
+We can provide mapping.
+
+Example:
+
+```
+com.producer.Order
+        ↓
+com.consumer.Order
+```
+
+Or
+
+provide trusted packages and a list for deserializers.
+
+```
+Object
+```
+
+---
+
+Example
+
+```
+Topic 1 : Order
+
+Producer(P0)
+      ↓
+Consumer Group 1
+   C1
+   C2
+
+Topic 2 : Producer
+
+Producer(P0)
+      ↓
+Consumer Group 1
+```
+
+---
+
+If multiple listeners are needed for a single event,
+
+create one consumer using:
+
+```java
+@KafkaListener
+```
+
+It initializes one listener.
+
+In `application.properties`
+
+```properties
+kafka.listener.concurrency=3
+```
+
+Container Factory manages it automatically.
+
+
+---
+
+# Exception Handling in Consumers
+
+Possible exceptions:
+
+- Exception during deserialization.
+- Exception while processing the record.
+
+Consumer flow:
+
+```
+Poll
+  ↓
+Deserialize   (1)
+  ↓
+Process       (2)
+  ↓
+Commit Offset
+```
+
+---
+
+## 1. Deserialization Failure (Poison Pill)
+
+If deserialization fails:
+
+- Not able to process the record.
+- Offset is not committed.
+- Endless loop of consuming the same buggy message (Poison Pill).
+
+### Solution
+
+Use:
+
+- Deserialization Wrapper
+
+Send failed events to:
+
+- DLT (Dead Letter Topic)
+    - Failed events are stored here.
+
+Default behavior:
+
+- Don't retry.
+- Log it.
+- Commit offset.
+- Move to next record.
+
+Retry strategies can be configured using Beans.
+
+Available strategies:
+
+- FixedBackOff
+- ExponentialBackOff
+
+Recovery:
+
+- `DeadLetterPublishingRecoverer`
+
+Example DLT topic:
+
+```
+order-event-dlt
+```
+
+> (Important)
+
+---
+
+# Consumer Assignment Strategies
+
+Supported scenarios:
+
+✔ One consumer → Multiple topics
+
+✔ Multiple consumers in a group → Different topics
+
+✔ Multiple consumers → Same topic
+
+---
+
+## Assignment Strategies
+
+(Default)
+
+- Range Assignor
+    - Divides and distributes partitions.
+
+Other options:
+
+- Round Robin Assignor
+- Sticky Assignor
+
+---
+
+## Eager Rebalancer
+
+During rebalance:
+
+- Consumer stops reading.
+
+---
+
+## Cooperative Sticky Assignor
+
+- Tries to stick to existing partition assignments.
+- Allows read operations to continue while minimizing partition movement.
+
+Partition assignment strategy is configured in:
+
+```
+application.properties
+```
+
+---
+
+# Consumer Fetch Configuration
+
+Consumer fetch request settings:
+
+- Fetch request data size
+- Poll frequency
+- Minimum timeout
+- Maximum timeout
+- Fetch bytes
+
+Example:
+
+```properties
+max.poll.records=500
+```
+
+Suppose:
+
+One poll fetches:
+
+```
+2000 records
+```
+
+Flow:
+
+- Consumer keeps all records in its internal buffer.
+- Processes 500 records.
+- Commits offsets.
+- Polls again.
+
+No additional network call is made until the local buffer becomes empty.
