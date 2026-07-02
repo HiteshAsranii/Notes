@@ -1611,3 +1611,415 @@ Flow:
 - Polls again.
 
 No additional network call is made until the local buffer becomes empty.
+
+
+---
+
+# Transactions in Kafka
+
+Each Producer must have a **unique Transaction ID**.
+
+- Multiple producer instances → Different Transaction IDs.
+
+Configured in:
+
+```properties
+application.properties
+```
+
+Possible naming strategies:
+
+```text
+order-{serverPort}
+```
+
+or
+
+```text
+order-{hostname}
+```
+
+Avoid:
+
+```text
+{UUID}
+```
+
+because every restart generates a new Transaction ID, which is **not acceptable**.
+
+---
+
+# Transaction Coordinator
+
+Kafka internally maintains a topic:
+
+```
+__transaction_state
+```
+
+It:
+
+- Stores transaction information.
+- Has around **50 partitions**.
+- Is distributed across brokers.
+
+---
+
+## Producer Initialization
+
+Producer first finds the **Transaction Coordinator** by requesting any broker.
+
+Then Kafka assigns a:
+
+- Producer ID (PID) (Idempotency)
+
+The Transaction Coordinator writes metadata into the appropriate partition of:
+
+```
+__transaction_state
+```
+
+Partition is selected using hashing.
+
+Example entry:
+
+```text
+TID  = "order-service-0"
+PID  = 5     (received from Kafka)
+Epoch = 0
+State = EMPTY
+Partitions Involved = [ ]
+```
+
+---
+
+## Why do we need Transaction ID when Kafka already assigns a PID?
+
+Reason:
+
+Every time the producer/server restarts,
+
+the **PID may change**.
+
+If a stable **Transaction ID (TID)** exists,
+
+Kafka can associate the producer with the same logical producer and restore the correct Producer ID.
+
+---
+
+# Zombie Fencing
+
+Suppose:
+
+Producer 1 starts a transaction.
+
+Assigned:
+
+```
+TID
+PID
+State
+```
+
+Example:
+
+```
+TID1
+State → Ongoing
+```
+
+Now Producer 2 takes over Producer 1.
+
+It uses the same:
+
+```
+TID1
+```
+
+Kafka detects:
+
+- An ongoing transaction already exists.
+
+So it:
+
+- Aborts the previous transaction.
+- Increments the Epoch.
+
+Now if Producer 1 revives,
+
+it still has:
+
+```
+TID1
+PID = 5
+Epoch = 0
+```
+
+But Kafka already increased the Epoch to:
+
+```
+Epoch = 1
+```
+
+Therefore,
+
+Producer 1 becomes a **Zombie Producer**,
+
+and Kafka rejects its requests.
+
+---
+
+## Epoch
+
+Epoch is basically a **version number**.
+
+Every restart of the producer increases the Epoch for that:
+
+- Transaction ID
+- Producer ID
+
+---
+
+## Kubernetes
+
+Kubernetes can inject a stable Transaction ID into producer instances,
+
+so application code usually doesn't need to manage it manually.
+
+---
+
+# Transaction States
+
+State flow:
+
+```
+EMPTY
+   ↓
+ONGOING
+   ├── Prepare Commit
+   │        ↓
+   │      COMMIT
+   │
+   └── Prepare Abort
+            ↓
+          ABORT
+```
+
+These are rigid states.
+
+Once a transaction reaches:
+
+- Prepare Commit
+- Prepare Abort
+
+it **cannot return** to the ONGOING state.
+
+Even if the Transaction Coordinator crashes,
+
+after restart it must continue from the stored state.
+
+The Transaction Coordinator stores:
+
+- Transaction ID (TID)
+- Producer ID (PID)
+- Current State
+- Partitions involved
+- Timeout
+- Epoch
+
+All maintained **partition-wise** inside `__transaction_state`.
+
+Transactions are **single-threaded**.
+
+---
+
+# Outbox Pattern
+
+Suppose:
+
+```
+Place Order
+    ↓
+Save to DB
+    ↓
+Send Kafka Event
+```
+
+One of these operations may fail.
+
+Examples:
+
+- Order saved but event not published.
+- Event published but order not saved.
+
+This is known as the **Dual Write Problem**.
+
+---
+
+## Approach 1 — @Transactional + try/catch
+
+```
+@Transactional
+```
+
+Catch:
+
+Event may actually be published,
+
+but acknowledgement may not be received.
+
+Application rolls back the database transaction,
+
+while Kafka has already published the event.
+
+This creates inconsistency.
+
+---
+
+## Approach 2 — Two Phase Commit (2PC)
+
+Idea:
+
+Coordinate DB and Kafka commits together.
+
+However,
+
+**Kafka does not support traditional Two Phase Commit (2PC).**
+
+---
+
+# Two Phase Protocol
+
+Flow:
+
+```
+ONGOING
+
+      ├── Prepare Commit
+      │         ↓
+      │      Commit
+      │
+      └── Prepare Abort
+                ↓
+              Abort
+```
+
+Once transaction reaches Prepare stage,
+
+it cannot move back to:
+
+```
+ONGOING
+```
+
+Even if the Transaction Coordinator fails,
+
+after restart it must continue from the current state.
+
+---
+
+# Recommended Pattern
+
+Instead of publishing directly to Kafka,
+
+first write everything to the database.
+
+Flow:
+
+```
+Write to DB
+      ↓
+Read from DB
+      ↓
+Publish to Kafka
+```
+
+Database tables:
+
+- Order Table
+- Outbox Table
+
+Outbox stores the events waiting to be published.
+
+A separate process reads these records.
+
+Possible implementations:
+
+- Poller
+- CDC (Change Data Capture)
+
+---
+
+## Example Outbox Table
+
+| id | aggregate_type | event | agg_id | payload |
+|----|----------------|-------|--------|----------|
+|101|Order|order-event|Created At|Published|
+
+---
+
+# Poller Approach
+
+Multiple poller instances may lead to:
+
+- Duplicate processing
+- Ordering risk
+- Shared locking
+
+Other drawbacks:
+
+- Constant database load
+- Database cleanup required
+- Duplicate publishing
+
+Therefore,
+
+the Poller should handle **Idempotency**.
+
+---
+
+# CDC (Debezium)
+
+Instead of polling,
+
+the database itself informs about changes.
+
+Debezium reads database changes using:
+
+## WAL (Write Ahead Logging)
+
+Used by:
+
+- PostgreSQL
+
+MySQL equivalent:
+
+- Binary Log (Binlog)
+
+WAL also helps in:
+
+- Data recovery.
+
+Replication level:
+
+- Logical
+
+Logical replication stores metadata about the changes we want.
+
+Typical flow:
+
+1. Create a table.
+2. Create a Publication for specific tables.
+3. Subscribe only to that Publication.
+
+---
+
+## Kafka Connect
+
+Debezium works using:
+
+```
+Kafka Connect
+```
+
+Kafka Connect is part of the Kafka ecosystem and is used to integrate external systems like databases with Kafka.
